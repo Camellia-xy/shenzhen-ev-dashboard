@@ -386,7 +386,7 @@ with tabs[3]:
 with tabs[4]:
     st.subheader("交通分区充电模式聚类")
     st.caption("K-Means 使用24小时占用率曲线、充电桩容量、平均价格、CBD和动态定价属性；全部特征在聚类前进行标准化。")
-    cluster_count = st.slider("聚类数量 K", min_value=3, max_value=6, value=4)
+    cluster_count = st.slider("聚类数量 K", min_value=2, max_value=6, value=2)
     assignments, profiles, silhouette = get_clusters(data, cluster_count, start, end)
 
     c1, c2, c3 = st.columns(3)
@@ -432,7 +432,7 @@ with tabs[4]:
         score_frame = pd.DataFrame(
             [
                 {"K": candidate, "轮廓系数": get_clusters(data, candidate, start, end)[2]}
-                for candidate in range(3, 7)
+                for candidate in range(2, 7)
             ]
         )
         best_k = int(score_frame.loc[score_frame["轮廓系数"].idxmax(), "K"])
@@ -447,7 +447,7 @@ with tabs[4]:
         fig.update_xaxes(dtick=1)
         fig.update_layout(height=300, margin=dict(l=10, r=10, t=20, b=10), coloraxis_showscale=False)
         st.plotly_chart(fig, width="stretch")
-        st.success(f"在 K=3–6 的候选范围内，K={best_k} 的轮廓系数最高，建议作为报告中的主方案。")
+        st.success(f"在 K=2–6 的候选范围内，K={best_k} 的轮廓系数最高，建议作为报告中的主方案；如需更细画像，可切换 K 并同时说明轮廓系数下降。")
 
     fig = px.scatter_map(
         assignments,
@@ -592,5 +592,6 @@ with tabs[7]:
     - 天气相关性以每个时间点为一条观测，并先剔除典型小时规律；结果仅表示描述性关联，不代表因果关系。
     - 预测测试集严格晚于训练集；随机森林只读取历史目标值。天气增强模型将当小时天气预报和定价计划视为已知外生变量。
     - 小组提供的四目标 RMSE 图未用于模型优劣排序，因为不同目标的量纲不一致；平台只在同一占用目标内比较模型。
+    - 小组的时段聚类仅有24个小时样本，且原图中 K=2 的轮廓系数高于预设的 K=4，因此未把 K=4 结果直接当作最终结论。平台的主聚类对象是247个交通分区，并公开比较 K=2–6。
     """)
     st.link_button("打开 ST-EVCDP 官方数据仓库", "https://github.com/IntelligentSystemsLab/ST-EVCDP")
