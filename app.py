@@ -10,6 +10,7 @@ from src.analytics import (
     build_multivariate_frame,
     cluster_zones,
     evaluate_demand_models,
+    evaluate_demand_models_rolling,
     hour_adjusted_correlations,
     occupancy_summary,
     quality_report,
@@ -86,6 +87,11 @@ def get_clusters(_dataset: Dataset, n_clusters: int, start: pd.Timestamp, end: p
 @st.cache_data(show_spinner="正在训练需求预测模型…")
 def get_forecast(_summary: pd.DataFrame, _exogenous: pd.DataFrame):
     return evaluate_demand_models(_summary, exogenous=_exogenous)
+
+
+@st.cache_data(show_spinner="正在执行滚动时间回测…")
+def get_rolling_forecast(_summary: pd.DataFrame, _exogenous: pd.DataFrame):
+    return evaluate_demand_models_rolling(_summary, exogenous=_exogenous)
 
 
 try:
@@ -242,6 +248,64 @@ with tabs[1]:
     st.plotly_chart(fig, width="stretch")
     peak_hour = int(profile.loc[profile["utilization"].idxmax(), "hour"])
     st.info(f"所选日期范围内的典型需求峰值出现在 {peak_hour:02d}:00 左右。天气影响需要在剔除这一小时规律后再判断。")
+
+    time_patterns = filtered[["utilization"]].copy()
+    time_patterns["hour"] = time_patterns.index.hour
+    time_patterns["weekday_num"] = time_patterns.index.dayofweek
+    time_patterns["日期类型"] = time_patterns["weekday_num"].map(
+        lambda day: "周末" if day >= 5 else "工作日"
+    )
+    weekday_names = {0: "周一", 1: "周二", 2: "周三", 3: "周四", 4: "周五", 5: "周六", 6: "周日"}
+    time_patterns["星期"] = time_patterns["weekday_num"].map(weekday_names)
+
+    st.subheader("工作日与周末对比")
+    day_type_profile = (
+        time_patterns.groupby(["日期类型", "hour"], as_index=False)["utilization"].mean()
+    )
+    if day_type_profile["日期类型"].nunique() == 2:
+        fig = px.line(
+            day_type_profile,
+            x="hour",
+            y="utilization",
+            color="日期类型",
+            markers=True,
+            labels={"hour": "小时", "utilization": "平均占用率"},
+            color_discrete_map={"工作日": "#294f64", "周末": "#ef9c66"},
+        )
+        fig.update_xaxes(dtick=1)
+        fig.update_layout(height=390, margin=dict(l=10, r=10, t=30, b=10), hovermode="x unified")
+        st.plotly_chart(fig, width="stretch")
+        type_summary = time_patterns.groupby("日期类型")["utilization"].mean()
+        difference = type_summary["周末"] - type_summary["工作日"]
+        m1, m2, m3 = st.columns(3)
+        m1.metric("工作日平均占用率", f"{type_summary['工作日']:.1%}")
+        m2.metric("周末平均占用率", f"{type_summary['周末']:.1%}")
+        m3.metric("周末－工作日", f"{difference * 100:+.1f} 个百分点", help="正值表示周末平均占用率更高")
+    else:
+        st.info("当前日期范围只包含一种日期类型，扩大日期范围后可比较工作日与周末。")
+    st.caption("工作日按周一至周五定义，未另行扣除法定节假日；曲线为全市容量加权占用率的分组均值。")
+
+    st.subheader("星期 × 小时需求热力图")
+    weekday_order = list(weekday_names.values())
+    weekly_heatmap = time_patterns.pivot_table(
+        index="星期", columns="hour", values="utilization", aggfunc="mean"
+    ).reindex(weekday_order)
+    fig = px.imshow(
+        weekly_heatmap,
+        aspect="auto",
+        labels={"x": "小时", "y": "星期", "color": "平均占用率"},
+        color_continuous_scale=["#edf5f2", "#84c7b8", "#0f766e", "#17332d"],
+    )
+    fig.update_xaxes(dtick=1)
+    fig.update_traces(hovertemplate="%{y} %{x}:00<br>平均占用率 %{z:.1%}<extra></extra>")
+    fig.update_layout(height=400, margin=dict(l=10, r=10, t=30, b=10))
+    st.plotly_chart(fig, width="stretch")
+    st.download_button(
+        "下载时间规律数据（CSV）",
+        data=time_patterns.reset_index().to_csv(index=False).encode("utf-8-sig"),
+        file_name="shenzhen_ev_time_patterns.csv",
+        mime="text/csv",
+    )
 
 with tabs[2]:
     st.subheader("天气、价格与充电行为")
@@ -478,6 +542,7 @@ with tabs[5]:
     st.caption("目标为下一小时的全市平均忙碌充电桩数。三个方案使用同一时间测试集；增强模型假设当小时天气预报和定价计划已知。")
     forecast_exogenous = full_multivariate[["temperature", "humidity", "wind_speed", "has_rain", "avg_price"]]
     forecast_metrics, predictions, importance, split_time = get_forecast(full_summary, forecast_exogenous)
+    rolling_metrics = get_rolling_forecast(full_summary, forecast_exogenous)
     baseline = forecast_metrics.loc[forecast_metrics["model"] == "24小时季节性基线"].iloc[0]
     forest = forecast_metrics.loc[forecast_metrics["model"] == "随机森林"].iloc[0]
     enhanced = forecast_metrics.loc[forecast_metrics["model"] == "随机森林（天气+价格）"].iloc[0]
@@ -534,9 +599,62 @@ with tabs[5]:
         fig.update_layout(height=350, margin=dict(l=10, r=10, t=35, b=10), coloraxis_showscale=False)
         st.plotly_chart(fig, width="stretch")
 
+    st.subheader("滚动时间回测：结果是否跨窗口稳定")
+    st.caption("使用4个连续且互不重叠的72小时测试窗；每一折只用测试窗之前的数据训练，指标越稳定越可信。")
+    rolling_summary = (
+        rolling_metrics.groupby("model", as_index=False)
+        .agg(
+            MAE均值=("MAE", "mean"),
+            MAE标准差=("MAE", "std"),
+            RMSE均值=("RMSE", "mean"),
+            R2均值=("R2", "mean"),
+        )
+        .rename(columns={"model": "模型"})
+    )
+    rolling_display = rolling_summary.copy()
+    rolling_display[["MAE均值", "MAE标准差", "RMSE均值", "R2均值"]] = rolling_display[
+        ["MAE均值", "MAE标准差", "RMSE均值", "R2均值"]
+    ].round(3)
+    rolling_left, rolling_right = st.columns([1, 1.25])
+    with rolling_left:
+        st.dataframe(rolling_display, width="stretch", hide_index=True)
+    with rolling_right:
+        fig = px.line(
+            rolling_metrics,
+            x="fold",
+            y="MAE",
+            color="model",
+            markers=True,
+            labels={"fold": "回测窗口", "model": "模型"},
+            color_discrete_map={"24小时季节性基线": "#ef9c66", "随机森林": "#8eb7aa", "随机森林（天气+价格）": "#16866f"},
+        )
+        fig.update_xaxes(dtick=1)
+        fig.update_layout(height=320, margin=dict(l=10, r=10, t=20, b=10), hovermode="x unified")
+        st.plotly_chart(fig, width="stretch")
+    rolling_pivot = rolling_metrics.pivot(index="fold", columns="model", values="MAE")
+    if {"随机森林", "随机森林（天气+价格）"}.issubset(rolling_pivot.columns):
+        enhanced_wins = int(
+            (rolling_pivot["随机森林（天气+价格）"] < rolling_pivot["随机森林"]).sum()
+        )
+        total_splits = len(rolling_pivot)
+        rolling_improvement = 1 - (
+            rolling_pivot["随机森林（天气+价格）"].mean()
+            / rolling_pivot["随机森林"].mean()
+        )
+        st.info(
+            f"天气增强模型的{total_splits}折平均 MAE 相比基础随机森林降低 {rolling_improvement:.1%}，"
+            f"但只在 {enhanced_wins}/{total_splits} 个窗口中更优。该提升存在但并非每个时段都稳定，不宜夸大天气变量作用。"
+        )
+
     d1, d2 = st.columns(2)
     d1.download_button("下载预测明细（CSV）", predictions.to_csv(index=False).encode("utf-8-sig"), "shenzhen_ev_forecast.csv", "text/csv")
     d2.download_button("下载模型指标（CSV）", forecast_metrics.to_csv(index=False).encode("utf-8-sig"), "shenzhen_ev_model_metrics.csv", "text/csv")
+    st.download_button(
+        "下载滚动回测明细（CSV）",
+        rolling_metrics.to_csv(index=False).encode("utf-8-sig"),
+        "shenzhen_ev_rolling_backtest.csv",
+        "text/csv",
+    )
 
     if enhanced["MAE"] < forest["MAE"]:
         st.success(f"加入天气与价格后，MAE 相比基础随机森林降低 {weather_improvement:.1%}，相比24小时基线降低 {baseline_improvement:.1%}。")

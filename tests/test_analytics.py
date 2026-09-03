@@ -7,6 +7,7 @@ from src.analytics import (
     cluster_zones,
     demand_forecast_features,
     evaluate_demand_models,
+    evaluate_demand_models_rolling,
     hour_adjusted_correlations,
     occupancy_summary,
     quality_report,
@@ -141,6 +142,25 @@ class AnalyticsTests(unittest.TestCase):
         self.assertIn("随机森林（天气+价格）", set(metrics["model"]))
         self.assertIn("weather_price_forest", predictions.columns)
         self.assertIn("temperature", set(importance["feature"]))
+
+    def test_rolling_forecast_uses_chronological_non_overlapping_windows(self):
+        index = pd.date_range("2022-01-01", periods=24 * 40, freq="1h")
+        signal = pd.Series(index.hour, index=index).map(lambda hour: 100 + 20 * (8 <= hour <= 20))
+        summary = pd.DataFrame({"busy_piles": signal.astype(float)}, index=index)
+        result = evaluate_demand_models_rolling(
+            summary,
+            test_window=48,
+            max_splits=3,
+            n_estimators=20,
+        )
+        self.assertEqual(result["fold"].nunique(), 3)
+        self.assertEqual(set(result["model"]), {"24小时季节性基线", "随机森林"})
+        fold_windows = result.drop_duplicates("fold").sort_values("fold")
+        self.assertTrue((fold_windows["train_end"] < fold_windows["test_start"]).all())
+        current_starts = fold_windows["test_start"].iloc[1:].reset_index(drop=True)
+        previous_ends = fold_windows["test_end"].iloc[:-1].reset_index(drop=True)
+        self.assertTrue((current_starts > previous_ends).all())
+        self.assertTrue((result["test_hours"] == 48).all())
 
 
 if __name__ == "__main__":

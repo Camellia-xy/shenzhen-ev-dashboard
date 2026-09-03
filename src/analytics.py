@@ -169,10 +169,47 @@ def demand_forecast_features(
     return hourly.dropna()
 
 
+def _make_forest(n_estimators: int = 300) -> RandomForestRegressor:
+    """Create the shared, deterministic forecast estimator."""
+    return RandomForestRegressor(
+        n_estimators=n_estimators,
+        max_depth=10,
+        min_samples_leaf=2,
+        random_state=42,
+        n_jobs=-1,
+    )
+
+
+def _forecast_feature_columns(frame: pd.DataFrame) -> tuple[list[str], list[str]]:
+    external_columns = [
+        column
+        for column in ("temperature", "humidity", "wind_speed", "has_rain", "avg_price")
+        if column in frame.columns
+    ]
+    feature_columns = [
+        column for column in frame.columns if column != "target" and column not in external_columns
+    ]
+    return feature_columns, external_columns
+
+
+def _metric_row(
+    name: str,
+    actual: pd.Series,
+    predicted: pd.Series | np.ndarray,
+) -> dict[str, float | str]:
+    return {
+        "model": name,
+        "MAE": float(mean_absolute_error(actual, predicted)),
+        "RMSE": float(np.sqrt(mean_squared_error(actual, predicted))),
+        "R2": float(r2_score(actual, predicted)),
+    }
+
+
 def evaluate_demand_models(
     summary: pd.DataFrame,
     test_ratio: float = 0.2,
     exogenous: pd.DataFrame | None = None,
+    n_estimators: int = 300,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.Timestamp]:
     """Backtest seasonal and RF models using one shared chronological split."""
     if not 0.1 <= test_ratio <= 0.4:
@@ -182,22 +219,9 @@ def evaluate_demand_models(
     if split < 50 or len(frame) - split < 10:
         raise ValueError("时间序列过短，无法进行可靠的训练测试切分")
 
-    external_columns = [
-        column
-        for column in ("temperature", "humidity", "wind_speed", "has_rain", "avg_price")
-        if column in frame.columns
-    ]
-    feature_columns = [
-        column for column in frame.columns if column != "target" and column not in external_columns
-    ]
+    feature_columns, external_columns = _forecast_feature_columns(frame)
     train, test = frame.iloc[:split], frame.iloc[split:]
-    model = RandomForestRegressor(
-        n_estimators=300,
-        max_depth=10,
-        min_samples_leaf=2,
-        random_state=42,
-        n_jobs=-1,
-    )
+    model = _make_forest(n_estimators)
     model.fit(train[feature_columns], train["target"])
 
     prediction_frame = pd.DataFrame(index=test.index)
@@ -209,13 +233,7 @@ def evaluate_demand_models(
     importance_columns = feature_columns
     if external_columns:
         enhanced_columns = feature_columns + external_columns
-        enhanced = RandomForestRegressor(
-            n_estimators=300,
-            max_depth=10,
-            min_samples_leaf=2,
-            random_state=42,
-            n_jobs=-1,
-        )
+        enhanced = _make_forest(n_estimators)
         enhanced.fit(train[enhanced_columns], train["target"])
         prediction_frame["weather_price_forest"] = enhanced.predict(test[enhanced_columns])
         importance_model = enhanced
@@ -231,19 +249,71 @@ def evaluate_demand_models(
     for name, column in model_columns:
         actual = prediction_frame["actual"]
         predicted = prediction_frame[column]
-        rows.append(
-            {
-                "model": name,
-                "MAE": float(mean_absolute_error(actual, predicted)),
-                "RMSE": float(np.sqrt(mean_squared_error(actual, predicted))),
-                "R2": float(r2_score(actual, predicted)),
-            }
-        )
+        rows.append(_metric_row(name, actual, predicted))
     metrics = pd.DataFrame(rows)
     importance = pd.DataFrame(
         {"feature": importance_columns, "importance": importance_model.feature_importances_}
     ).sort_values("importance", ascending=False)
     return metrics, prediction_frame.reset_index(), importance, test.index.min()
+
+
+def evaluate_demand_models_rolling(
+    summary: pd.DataFrame,
+    exogenous: pd.DataFrame | None = None,
+    test_window: int = 72,
+    max_splits: int = 4,
+    n_estimators: int = 100,
+) -> pd.DataFrame:
+    """Evaluate forecast models over chronological expanding-window splits."""
+    if test_window < 24:
+        raise ValueError("每个回测窗口至少需要24小时")
+    if max_splits < 2:
+        raise ValueError("滚动回测至少需要2折")
+
+    frame = demand_forecast_features(summary, exogenous=exogenous)
+    minimum_train = 24 * 7
+    initial_train = max(minimum_train, len(frame) - test_window * max_splits)
+    available_splits = (len(frame) - initial_train) // test_window
+    if available_splits < 2:
+        raise ValueError("时间序列过短，无法进行至少2折滚动回测")
+    split_count = min(max_splits, available_splits)
+    initial_train = len(frame) - test_window * split_count
+
+    feature_columns, external_columns = _forecast_feature_columns(frame)
+    rows: list[dict[str, float | str | int | pd.Timestamp]] = []
+    for fold_index in range(split_count):
+        test_start_position = initial_train + fold_index * test_window
+        test_end_position = test_start_position + test_window
+        train = frame.iloc[:test_start_position]
+        test = frame.iloc[test_start_position:test_end_position]
+
+        base_model = _make_forest(n_estimators)
+        base_model.fit(train[feature_columns], train["target"])
+        predictions: list[tuple[str, pd.Series | np.ndarray]] = [
+            ("24小时季节性基线", test["lag_24"]),
+            ("随机森林", base_model.predict(test[feature_columns])),
+        ]
+        if external_columns:
+            enhanced_columns = feature_columns + external_columns
+            enhanced_model = _make_forest(n_estimators)
+            enhanced_model.fit(train[enhanced_columns], train["target"])
+            predictions.append(
+                ("随机森林（天气+价格）", enhanced_model.predict(test[enhanced_columns]))
+            )
+
+        for model_name, predicted in predictions:
+            row = _metric_row(model_name, test["target"], predicted)
+            row.update(
+                {
+                    "fold": fold_index + 1,
+                    "train_end": train.index.max(),
+                    "test_start": test.index.min(),
+                    "test_end": test.index.max(),
+                    "test_hours": len(test),
+                }
+            )
+            rows.append(row)
+    return pd.DataFrame(rows)
 
 
 def quality_report(
