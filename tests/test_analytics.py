@@ -4,10 +4,12 @@ import pandas as pd
 
 from src.analytics import (
     build_multivariate_frame,
+    cluster_profile_summary,
     cluster_zones,
     demand_forecast_features,
     evaluate_demand_models,
     evaluate_demand_models_rolling,
+    evaluate_cluster_candidates,
     hour_adjusted_correlations,
     occupancy_summary,
     quality_report,
@@ -78,6 +80,23 @@ class AnalyticsTests(unittest.TestCase):
         self.assertEqual(assignments["cluster"].nunique(), 2)
         self.assertEqual(len(profiles), 48)
         self.assertGreater(score, 0.9)
+
+        summary = cluster_profile_summary(assignments, profiles)
+        self.assertEqual(len(summary), 2)
+        self.assertTrue(summary["profile_name"].str.contains("占用").all())
+        self.assertTrue(summary["profile_name"].str.contains("峰值").all())
+
+        candidates = evaluate_cluster_candidates(
+            occupancy,
+            price,
+            info,
+            min_clusters=2,
+            max_clusters=2,
+            stability_runs=3,
+        )
+        self.assertEqual(candidates["K"].tolist(), [2])
+        self.assertTrue(candidates["stability_ari"].between(-1, 1).all())
+        self.assertTrue(candidates["min_cluster_share"].between(0, 1).all())
 
     def test_forecast_features_do_not_use_current_target(self):
         index = pd.date_range("2022-01-01", periods=240, freq="1h")

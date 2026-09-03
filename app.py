@@ -8,7 +8,9 @@ import streamlit as st
 
 from src.analytics import (
     build_multivariate_frame,
+    cluster_profile_summary,
     cluster_zones,
+    evaluate_cluster_candidates,
     evaluate_demand_models,
     evaluate_demand_models_rolling,
     hour_adjusted_correlations,
@@ -82,6 +84,17 @@ def get_clusters(_dataset: Dataset, n_clusters: int, start: pd.Timestamp, end: p
         _dataset.information,
         n_clusters=n_clusters,
     )
+
+
+@st.cache_data(show_spinner="正在评估聚类稳定性…")
+def get_cluster_candidates(_dataset: Dataset, start: pd.Timestamp, end: pd.Timestamp):
+    occupancy = _dataset.occupancy.loc[
+        (_dataset.occupancy.index >= start) & (_dataset.occupancy.index < end)
+    ]
+    price = _dataset.price.loc[
+        (_dataset.price.index >= start) & (_dataset.price.index < end)
+    ]
+    return evaluate_cluster_candidates(occupancy, price, _dataset.information)
 
 
 @st.cache_data(show_spinner="正在训练需求预测模型…")
@@ -450,75 +463,142 @@ with tabs[3]:
 with tabs[4]:
     st.subheader("交通分区充电模式聚类")
     st.caption("K-Means 使用24小时占用率曲线、充电桩容量、平均价格、CBD和动态定价属性；全部特征在聚类前进行标准化。")
-    cluster_count = st.slider("聚类数量 K", min_value=2, max_value=6, value=2)
+    score_frame = get_cluster_candidates(data, start, end)
+    reliable_candidates = score_frame[
+        (score_frame["stability_ari"] >= 0.8) & (score_frame["min_cluster_share"] >= 0.05)
+    ]
+    recommendation_pool = reliable_candidates if not reliable_candidates.empty else score_frame
+    best_k = int(recommendation_pool.loc[recommendation_pool["silhouette"].idxmax(), "K"])
+    cluster_count = st.slider(
+        "聚类数量 K",
+        min_value=2,
+        max_value=6,
+        value=best_k,
+        help="默认推荐同时满足重采样稳定性≥0.8、最小群组占比≥5%，再选择轮廓系数最高的方案。",
+    )
     assignments, profiles, silhouette = get_clusters(data, cluster_count, start, end)
+    profile_summary = cluster_profile_summary(assignments, profiles)
+    profile_names = profile_summary.set_index("cluster")["profile_name"]
+    display_assignments = assignments.copy()
+    display_assignments["profile_name"] = display_assignments["cluster"].map(profile_names)
+    display_profiles = profiles.copy()
+    display_profiles["profile_name"] = display_profiles["cluster"].map(profile_names)
+    selected_score = score_frame.set_index("K").loc[cluster_count]
 
-    c1, c2, c3 = st.columns(3)
+    c1, c2, c3, c4 = st.columns(4)
     c1.metric("聚类数量", cluster_count)
     c2.metric("轮廓系数", f"{silhouette:.3f}", help="越接近1，类内越紧凑、类间越分离")
-    c3.metric("已覆盖分区", f"{len(assignments)}/{len(data.information)}")
+    c3.metric("重采样稳定性", f"{selected_score['stability_ari']:.3f}", help="80%分区重采样后的调整兰德指数（ARI）均值，越接近1越稳定")
+    c4.metric("最小群组占比", f"{selected_score['min_cluster_share']:.1%}", help="最小群组包含的交通分区比例，过小可能只是离群点集合")
 
     left, right = st.columns([1.15, 1])
     with left:
         fig = px.line(
-            profiles,
+            display_profiles,
             x="hour",
             y="utilization",
-            color="cluster",
+            color="profile_name",
             markers=True,
-            labels={"hour": "小时", "utilization": "平均占用率", "cluster": "聚类"},
+            labels={"hour": "小时", "utilization": "平均占用率", "profile_name": "聚类画像"},
             color_discrete_sequence=px.colors.qualitative.Safe,
         )
         fig.update_xaxes(dtick=2)
         fig.update_layout(height=430, margin=dict(l=10, r=10, t=30, b=10), hovermode="x unified")
         st.plotly_chart(fig, width="stretch")
     with right:
-        cluster_stats = (
-            assignments.groupby("cluster")
-            .agg(
-                分区数量=("grid", "count"),
-                平均占用率=("avg_utilization", "mean"),
-                平均容量=("count", "mean"),
-                平均价格=("avg_price", "mean"),
-                典型峰值小时=("peak_hour", "median"),
-            )
-            .reset_index()
-            .rename(columns={"cluster": "聚类"})
+        cluster_stats = profile_summary[
+            ["profile_name", "zone_count", "avg_utilization", "avg_capacity", "avg_price", "cbd_share", "dynamic_pricing_share", "peak_hour"]
+        ].rename(
+            columns={
+                "profile_name": "聚类画像",
+                "zone_count": "分区数量",
+                "avg_utilization": "平均占用率",
+                "avg_capacity": "平均容量",
+                "avg_price": "平均价格",
+                "cbd_share": "CBD占比",
+                "dynamic_pricing_share": "动态定价占比",
+                "peak_hour": "典型峰值小时",
+            }
         )
         cluster_stats["平均占用率"] = cluster_stats["平均占用率"].map(lambda value: f"{value:.1%}")
         cluster_stats["平均容量"] = cluster_stats["平均容量"].round(1)
         cluster_stats["平均价格"] = cluster_stats["平均价格"].round(2)
+        cluster_stats["CBD占比"] = cluster_stats["CBD占比"].map(lambda value: f"{value:.1%}")
+        cluster_stats["动态定价占比"] = cluster_stats["动态定价占比"].map(lambda value: f"{value:.1%}")
         cluster_stats["典型峰值小时"] = cluster_stats["典型峰值小时"].round().astype(int).map(lambda value: f"{value:02d}:00")
         st.dataframe(cluster_stats, width="stretch", hide_index=True)
-        st.info("轮廓系数用于比较不同 K 值；最终聚类数还应结合曲线差异和业务可解释性确定。")
+        st.info("画像名称只概括该类的相对占用水平和典型峰值时段；括号内保留原始群组编号，便于复核。")
 
     with st.expander("查看聚类数量 K 的选择依据", expanded=True):
-        score_frame = pd.DataFrame(
-            [
-                {"K": candidate, "轮廓系数": get_clusters(data, candidate, start, end)[2]}
-                for candidate in range(2, 7)
-            ]
+        score_chart = score_frame.rename(
+            columns={"silhouette": "轮廓系数", "stability_ari": "重采样稳定性"}
+        ).melt(
+            id_vars="K",
+            value_vars=["轮廓系数", "重采样稳定性"],
+            var_name="评估指标",
+            value_name="得分",
         )
-        best_k = int(score_frame.loc[score_frame["轮廓系数"].idxmax(), "K"])
-        fig = px.bar(
-            score_frame,
+        fig = px.line(
+            score_chart,
             x="K",
-            y="轮廓系数",
-            text_auto=".3f",
-            color="轮廓系数",
-            color_continuous_scale=["#d9f1e9", "#167d68"],
+            y="得分",
+            color="评估指标",
+            markers=True,
+            color_discrete_map={"轮廓系数": "#167d68", "重采样稳定性": "#ef9c66"},
         )
         fig.update_xaxes(dtick=1)
-        fig.update_layout(height=300, margin=dict(l=10, r=10, t=20, b=10), coloraxis_showscale=False)
+        fig.update_yaxes(range=[0, 1])
+        fig.update_layout(height=320, margin=dict(l=10, r=10, t=20, b=10), hovermode="x unified")
         st.plotly_chart(fig, width="stretch")
-        st.success(f"在 K=2–6 的候选范围内，K={best_k} 的轮廓系数最高，建议作为报告中的主方案；如需更细画像，可切换 K 并同时说明轮廓系数下降。")
+        score_display = score_frame.rename(
+            columns={
+                "silhouette": "轮廓系数",
+                "stability_ari": "稳定性ARI均值",
+                "stability_std": "ARI标准差",
+                "min_cluster_share": "最小群组占比",
+            }
+        )
+        score_display[["轮廓系数", "稳定性ARI均值", "ARI标准差"]] = score_display[
+            ["轮廓系数", "稳定性ARI均值", "ARI标准差"]
+        ].round(3)
+        score_display["最小群组占比"] = score_display["最小群组占比"].map(lambda value: f"{value:.1%}")
+        st.dataframe(score_display, width="stretch", hide_index=True)
+        st.success(
+            f"推荐 K={best_k}：先排除稳定性低于0.8或最小群组不足5%的方案，再在剩余候选中选择轮廓系数最高者。"
+            "如需更细画像，可切换 K，但应同时报告三项指标的变化。"
+        )
+
+    st.subheader("聚类画像对比")
+    image_columns = {
+        "avg_utilization": "平均占用率",
+        "avg_capacity": "平均容量",
+        "avg_price": "平均价格",
+        "cbd_share": "CBD占比",
+        "dynamic_pricing_share": "动态定价占比",
+        "morning_utilization": "早间占用率",
+        "evening_utilization": "晚间占用率",
+    }
+    image_frame = profile_summary.set_index("profile_name")[list(image_columns)].rename(columns=image_columns)
+    image_std = image_frame.std(ddof=0).replace(0, 1)
+    standardized_image = (image_frame - image_frame.mean()) / image_std
+    fig = px.imshow(
+        standardized_image,
+        aspect="auto",
+        labels={"x": "画像特征", "y": "聚类画像", "color": "相对全体均值"},
+        color_continuous_scale=["#294f64", "#f7faf9", "#ef9c66"],
+        color_continuous_midpoint=0,
+    )
+    fig.update_traces(hovertemplate="%{y}<br>%{x}<br>标准化差异 %{z:+.2f}<extra></extra>")
+    fig.update_layout(height=max(260, 85 * cluster_count), margin=dict(l=10, r=10, t=25, b=10))
+    st.plotly_chart(fig, width="stretch")
+    st.caption("颜色表示每项特征相对当前聚类方案总体均值的标准化差异，只用于同一列内比较，不代表不同单位可以直接相加。")
 
     fig = px.scatter_map(
-        assignments,
+        display_assignments,
         lat="la",
         lon="lon",
         size="count",
-        color="cluster",
+        color="profile_name",
         hover_name="grid",
         hover_data={"count": True, "avg_utilization": ":.1%", "peak_hour": True, "la": False, "lon": False},
         size_max=28,
@@ -526,14 +606,21 @@ with tabs[4]:
         center={"lat": 22.57, "lon": 114.05},
         map_style="open-street-map",
         color_discrete_sequence=px.colors.qualitative.Safe,
-        labels={"cluster": "聚类", "count": "充电桩数", "avg_utilization": "平均占用率", "peak_hour": "峰值小时"},
+        labels={"profile_name": "聚类画像", "count": "充电桩数", "avg_utilization": "平均占用率", "peak_hour": "峰值小时"},
     )
     fig.update_layout(height=560, margin=dict(l=0, r=0, t=20, b=0))
     st.plotly_chart(fig, width="stretch")
-    st.download_button(
+    download_left, download_right = st.columns(2)
+    download_left.download_button(
         "下载分区聚类结果（CSV）",
-        data=assignments.to_csv(index=False).encode("utf-8-sig"),
+        data=display_assignments.to_csv(index=False).encode("utf-8-sig"),
         file_name=f"shenzhen_ev_clusters_k{cluster_count}.csv",
+        mime="text/csv",
+    )
+    download_right.download_button(
+        "下载聚类画像（CSV）",
+        data=profile_summary.to_csv(index=False).encode("utf-8-sig"),
+        file_name=f"shenzhen_ev_cluster_profiles_k{cluster_count}.csv",
         mime="text/csv",
     )
 

@@ -4,7 +4,7 @@ import numpy as np
 import pandas as pd
 from sklearn.cluster import KMeans
 from sklearn.ensemble import RandomForestRegressor
-from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from sklearn.metrics import adjusted_rand_score, mean_absolute_error, mean_squared_error, r2_score
 from sklearn.metrics import silhouette_score
 from sklearn.preprocessing import StandardScaler
 
@@ -134,6 +134,126 @@ def cluster_zones(
         id_vars="hour", var_name="cluster", value_name="utilization"
     )
     return assignments, profiles, score
+
+
+def evaluate_cluster_candidates(
+    occupancy: pd.DataFrame,
+    price: pd.DataFrame,
+    information: pd.DataFrame,
+    min_clusters: int = 2,
+    max_clusters: int = 6,
+    stability_runs: int = 6,
+    sample_fraction: float = 0.8,
+) -> pd.DataFrame:
+    """Compare K values by separation, balance and resampling stability.
+
+    Stability is the mean adjusted Rand index between the full-data solution
+    and solutions fitted on repeated subsamples, then predicted for all zones.
+    """
+    features, _ = zone_cluster_features(occupancy, price, information)
+    if not 2 <= min_clusters <= max_clusters < len(features):
+        raise ValueError("候选聚类数必须不小于2且小于交通分区数量")
+    if stability_runs < 2:
+        raise ValueError("稳定性评估至少需要2次重采样")
+    if not 0.5 <= sample_fraction < 1:
+        raise ValueError("重采样比例必须在0.5到1之间")
+
+    feature_values = features.to_numpy(dtype=float)
+    scaled = StandardScaler().fit_transform(feature_values)
+    rows = []
+    for n_clusters in range(min_clusters, max_clusters + 1):
+        reference = KMeans(n_clusters=n_clusters, random_state=42, n_init=20)
+        reference_labels = reference.fit_predict(scaled)
+        rng = np.random.default_rng(4200 + n_clusters)
+        sample_size = min(
+            len(features),
+            max(n_clusters * 3, int(round(len(features) * sample_fraction))),
+        )
+        stability_scores = []
+        for run in range(stability_runs):
+            sample_indices = rng.choice(len(features), size=sample_size, replace=False)
+            sample_scaler = StandardScaler().fit(feature_values[sample_indices])
+            sampled_model = KMeans(
+                n_clusters=n_clusters,
+                random_state=1000 + run,
+                n_init=10,
+            )
+            sampled_model.fit(sample_scaler.transform(feature_values[sample_indices]))
+            stability_scores.append(
+                adjusted_rand_score(
+                    reference_labels,
+                    sampled_model.predict(sample_scaler.transform(feature_values)),
+                )
+            )
+        cluster_counts = np.bincount(reference_labels, minlength=n_clusters)
+        rows.append(
+            {
+                "K": n_clusters,
+                "silhouette": float(silhouette_score(scaled, reference_labels)),
+                "stability_ari": float(np.mean(stability_scores)),
+                "stability_std": float(np.std(stability_scores, ddof=1)),
+                "min_cluster_share": float(cluster_counts.min() / len(features)),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def cluster_profile_summary(
+    assignments: pd.DataFrame,
+    profiles: pd.DataFrame,
+) -> pd.DataFrame:
+    """Build human-readable, evidence-based summaries for zone clusters."""
+    summary = (
+        assignments.groupby("cluster")
+        .agg(
+            zone_count=("grid", "count"),
+            avg_utilization=("avg_utilization", "mean"),
+            avg_capacity=("count", "mean"),
+            avg_price=("avg_price", "mean"),
+            cbd_share=("CBD", "mean"),
+            dynamic_pricing_share=("dynamic_pricing", "mean"),
+            peak_hour=("peak_hour", "median"),
+        )
+        .reset_index()
+    )
+    profile_wide = profiles.pivot(index="cluster", columns="hour", values="utilization")
+    periods = {
+        "overnight_utilization": list(range(0, 6)),
+        "morning_utilization": list(range(6, 11)),
+        "daytime_utilization": list(range(11, 17)),
+        "evening_utilization": list(range(17, 22)),
+        "late_utilization": list(range(22, 24)),
+    }
+    for column, hours in periods.items():
+        available_hours = [hour for hour in hours if hour in profile_wide.columns]
+        summary[column] = summary["cluster"].map(
+            profile_wide[available_hours].mean(axis=1) if available_hours else pd.Series(dtype=float)
+        )
+
+    utilization_rank = summary["avg_utilization"].rank(method="average", pct=True)
+    levels = np.select(
+        [utilization_rank <= 1 / 3, utilization_rank > 2 / 3],
+        ["低占用", "高占用"],
+        default="中占用",
+    )
+
+    def peak_period(hour: float) -> str:
+        value = int(round(hour)) % 24
+        if value <= 5:
+            return "凌晨"
+        if value <= 10:
+            return "早间"
+        if value <= 16:
+            return "日间"
+        if value <= 21:
+            return "晚间"
+        return "夜间"
+
+    summary["profile_name"] = [
+        f"{level}·{peak_period(hour)}峰值（{cluster}）"
+        for level, hour, cluster in zip(levels, summary["peak_hour"], summary["cluster"])
+    ]
+    return summary
 
 
 def demand_forecast_features(
