@@ -1,0 +1,5 @@
+file,rows,columns,missing_before,negative_before,missing_after,adjusted_over_capacity
+occupancy.csv,8640,247,0,0,0,159
+duration.csv,8640,247,0,0,0,0
+volume.csv,8640,247,0,0,0,0
+price.csv,8640,247,0,0,0,0

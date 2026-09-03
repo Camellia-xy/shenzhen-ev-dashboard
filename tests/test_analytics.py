@@ -3,9 +3,11 @@ import unittest
 import pandas as pd
 
 from src.analytics import (
+    build_multivariate_frame,
     cluster_zones,
     demand_forecast_features,
     evaluate_demand_models,
+    hour_adjusted_correlations,
     occupancy_summary,
     quality_report,
     typical_day,
@@ -94,6 +96,51 @@ class AnalyticsTests(unittest.TestCase):
         self.assertAlmostEqual(metrics.loc[metrics["model"] == "24小时季节性基线", "MAE"].iloc[0], 0)
         self.assertEqual(predictions["time"].min(), split_time)
         self.assertGreater(importance["importance"].sum(), 0.99)
+
+    def test_multivariate_frame_aligns_official_and_supplemental_data(self):
+        summary = occupancy_summary(self.occupancy, self.info)
+        supplemental = pd.DataFrame(
+            {"temperature": [28, 29, 30, 31], "avg_duration": [1, 1, 2, 2]},
+            index=self.occupancy.index,
+        )
+        result = build_multivariate_frame(summary, self.price, supplemental)
+        self.assertEqual(len(result), 4)
+        self.assertAlmostEqual(result.iloc[0]["avg_price"], 0.9)
+        self.assertIn("temperature", result.columns)
+
+    def test_hour_adjusted_correlations_return_square_matrix(self):
+        index = pd.date_range("2022-01-01", periods=24 * 5, freq="1h")
+        frame = pd.DataFrame(
+            {
+                "demand": index.hour + pd.Series(range(len(index)), index=index) / 100,
+                "temperature": index.hour * 2 + pd.Series(range(len(index)), index=index) / 50,
+            },
+            index=index,
+        )
+        result = hour_adjusted_correlations(frame, ["demand", "temperature"])
+        self.assertEqual(result.shape, (2, 2))
+        self.assertAlmostEqual(result.loc["demand", "temperature"], 1.0)
+
+    def test_weather_enhanced_forecast_is_returned_when_features_exist(self):
+        index = pd.date_range("2022-01-01", periods=24 * 40, freq="1h")
+        signal = pd.Series(index.hour, index=index).map(lambda hour: 100 + 20 * (8 <= hour <= 20))
+        summary = pd.DataFrame({"busy_piles": signal.astype(float)}, index=index)
+        exogenous = pd.DataFrame(
+            {
+                "temperature": 25 + index.hour / 10,
+                "humidity": 80 - index.hour / 10,
+                "wind_speed": 2.0,
+                "has_rain": (index.dayofweek == 0).astype(int),
+                "avg_price": 1.0,
+            },
+            index=index,
+        )
+        metrics, predictions, importance, _ = evaluate_demand_models(
+            summary, exogenous=exogenous
+        )
+        self.assertIn("随机森林（天气+价格）", set(metrics["model"]))
+        self.assertIn("weather_price_forest", predictions.columns)
+        self.assertIn("temperature", set(importance["feature"]))
 
 
 if __name__ == "__main__":

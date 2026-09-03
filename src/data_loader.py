@@ -15,6 +15,19 @@ class Dataset:
 
 
 REQUIRED_FILES = ("information.csv", "occupancy.csv", "price.csv", "time.csv")
+SUPPLEMENTAL_COLUMNS = (
+    "temperature",
+    "station_pressure",
+    "sea_level_pressure",
+    "humidity",
+    "wind_speed",
+    "dew_point",
+    "visibility",
+    "cloud_cover",
+    "has_rain",
+    "avg_duration",
+    "avg_volume",
+)
 
 
 def validate_data_dir(data_dir: Path) -> None:
@@ -66,3 +79,20 @@ def load_dataset(data_dir: str | Path) -> Dataset:
         timestamps=timestamps,
     )
 
+
+def load_supplemental_metrics(path: str | Path) -> pd.DataFrame:
+    """Load the compact team-provided weather, duration and volume dataset."""
+    path = Path(path)
+    if not path.exists():
+        raise FileNotFoundError(f"缺少小组补充数据文件：{path.name}")
+
+    frame = pd.read_csv(path, parse_dates=["datetime"])
+    missing = [column for column in SUPPLEMENTAL_COLUMNS if column not in frame.columns]
+    if missing:
+        raise ValueError(f"{path.name} 缺少字段：{', '.join(missing)}")
+    if frame["datetime"].duplicated().any():
+        raise ValueError(f"{path.name} 存在重复时间戳")
+
+    frame = frame.set_index("datetime").sort_index()
+    frame.index.name = "time"
+    return frame[list(SUPPLEMENTAL_COLUMNS)].apply(pd.to_numeric, errors="coerce")

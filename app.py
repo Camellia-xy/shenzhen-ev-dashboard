@@ -7,18 +7,21 @@ import plotly.express as px
 import streamlit as st
 
 from src.analytics import (
+    build_multivariate_frame,
     cluster_zones,
     evaluate_demand_models,
+    hour_adjusted_correlations,
     occupancy_summary,
     quality_report,
     typical_day,
     zone_summary,
 )
-from src.data_loader import Dataset, load_dataset
+from src.data_loader import Dataset, load_dataset, load_supplemental_metrics
 
 
 ROOT = Path(__file__).resolve().parent
 DATA_DIR = ROOT / "data" / "raw"
+SUPPLEMENTAL_PATH = ROOT / "data" / "processed" / "supplemental_5min.csv.gz"
 
 
 st.set_page_config(
@@ -63,6 +66,11 @@ def get_data() -> Dataset:
     return load_dataset(DATA_DIR)
 
 
+@st.cache_data(show_spinner="正在读取小组补充数据…")
+def get_supplemental_data() -> pd.DataFrame:
+    return load_supplemental_metrics(SUPPLEMENTAL_PATH)
+
+
 @st.cache_data(show_spinner="正在训练 K-Means 聚类模型…")
 def get_clusters(_dataset: Dataset, n_clusters: int, start: pd.Timestamp, end: pd.Timestamp):
     occupancy = _dataset.occupancy.loc[( _dataset.occupancy.index >= start) & (_dataset.occupancy.index < end)]
@@ -76,18 +84,20 @@ def get_clusters(_dataset: Dataset, n_clusters: int, start: pd.Timestamp, end: p
 
 
 @st.cache_data(show_spinner="正在训练需求预测模型…")
-def get_forecast(_summary: pd.DataFrame):
-    return evaluate_demand_models(_summary)
+def get_forecast(_summary: pd.DataFrame, _exogenous: pd.DataFrame):
+    return evaluate_demand_models(_summary, exogenous=_exogenous)
 
 
 try:
     data = get_data()
+    supplemental = get_supplemental_data()
 except (FileNotFoundError, ValueError) as exc:
     st.error(str(exc))
     st.info("请按 README 的说明下载 ST-EVCDP 官方 CSV 文件后刷新页面。")
     st.stop()
 
 full_summary = occupancy_summary(data.occupancy, data.information)
+full_multivariate = build_multivariate_frame(full_summary, data.price, supplemental)
 
 with st.sidebar:
     st.title("⚡ EV Insight")
@@ -110,7 +120,7 @@ with st.sidebar:
     pricing_scope = st.multiselect("定价方式", ["动态定价", "固定定价"], default=["动态定价", "固定定价"])
     st.divider()
     st.success("官方数据已载入")
-    st.caption("ST-EVCDP · 4个原始CSV · 页面指标实时计算")
+    st.caption("ST-EVCDP 原始数据 + 小组天气/时长/电量补充数据")
 
 if isinstance(date_range, tuple) and len(date_range) == 2:
     start = pd.Timestamp(date_range[0])
@@ -125,6 +135,9 @@ else:
 
 filtered = occupancy_summary(filtered_occupancy, data.information)
 zones = zone_summary(filtered_occupancy, filtered_price, data.information)
+filtered_multivariate = full_multivariate[
+    (full_multivariate.index >= start) & (full_multivariate.index < end)
+]
 
 cbd_values = []
 if "CBD" in zone_scope:
@@ -150,7 +163,7 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-tabs = st.tabs(["运营总览", "时间规律", "空间分布", "分区聚类", "需求预测", "数据质量", "数据与口径"])
+tabs = st.tabs(["运营总览", "时间规律", "天气与能耗", "空间分布", "分区聚类", "需求预测", "数据质量", "数据与口径"])
 
 with tabs[0]:
     peak_time = filtered["busy_piles"].idxmax()
@@ -228,9 +241,115 @@ with tabs[1]:
     fig.update_layout(height=430, margin=dict(l=10, r=10, t=35, b=10))
     st.plotly_chart(fig, width="stretch")
     peak_hour = int(profile.loc[profile["utilization"].idxmax(), "hour"])
-    st.info(f"所选日期范围内的典型需求峰值出现在 {peak_hour:02d}:00 左右。后续将加入工作日/周末显著性检验和天气联动分析。")
+    st.info(f"所选日期范围内的典型需求峰值出现在 {peak_hour:02d}:00 左右。天气影响需要在剔除这一小时规律后再判断。")
 
 with tabs[2]:
+    st.subheader("天气、价格与充电行为")
+    st.markdown(
+        '<div class="section-note">天气来自小组整理的5分钟序列；时长和电量由247个交通分区的清洗结果按时间取均值。相关性先按时间聚合，再剔除各变量的典型小时规律。</div>',
+        unsafe_allow_html=True,
+    )
+    w1, w2, w3, w4 = st.columns(4)
+    w1.metric("平均温度", f"{filtered_multivariate['temperature'].mean():.1f} °C")
+    w2.metric("雨天时间占比", f"{filtered_multivariate['has_rain'].mean():.1%}")
+    w3.metric("平均充电时长", f"{filtered_multivariate['avg_duration'].mean():.2f} 小时")
+    w4.metric("平均充电电量", f"{filtered_multivariate['avg_volume'].mean():.1f} kWh")
+
+    profile_columns = ["utilization", "avg_volume", "temperature", "avg_price"]
+    hourly_profile = filtered_multivariate[profile_columns].groupby(
+        filtered_multivariate.index.hour
+    ).mean()
+    standardized = (hourly_profile - hourly_profile.mean()) / hourly_profile.std(ddof=0)
+    standardized = standardized.rename(
+        columns={
+            "utilization": "占用率",
+            "avg_volume": "充电电量",
+            "temperature": "温度",
+            "avg_price": "价格",
+        }
+    )
+    standardized.index.name = "小时"
+    profile_long = standardized.reset_index().melt(
+        id_vars="小时", var_name="指标", value_name="标准化指数"
+    )
+    fig = px.line(
+        profile_long,
+        x="小时",
+        y="标准化指数",
+        color="指标",
+        markers=True,
+        title="典型24小时多指标变化（各指标标准化后可比较形状）",
+        color_discrete_map={"占用率": "#16866f", "充电电量": "#294f64", "温度": "#ef9c66", "价格": "#8b6bb8"},
+    )
+    fig.update_xaxes(dtick=2)
+    fig.update_layout(height=410, margin=dict(l=10, r=10, t=45, b=10), hovermode="x unified")
+    st.plotly_chart(fig, width="stretch")
+
+    correlation_columns = [
+        "avg_price",
+        "utilization",
+        "avg_duration",
+        "avg_volume",
+        "temperature",
+        "humidity",
+        "wind_speed",
+        "has_rain",
+    ]
+    correlation = hour_adjusted_correlations(filtered_multivariate, correlation_columns)
+    correlation_labels = {
+        "avg_price": "价格",
+        "utilization": "占用率",
+        "avg_duration": "充电时长",
+        "avg_volume": "充电电量",
+        "temperature": "温度",
+        "humidity": "湿度",
+        "wind_speed": "风速",
+        "has_rain": "降雨",
+    }
+    correlation = correlation.rename(index=correlation_labels, columns=correlation_labels)
+
+    left, right = st.columns([1.25, 0.75])
+    with left:
+        fig = px.imshow(
+            correlation,
+            text_auto=".2f",
+            zmin=-1,
+            zmax=1,
+            color_continuous_scale="RdBu_r",
+            title="去除小时规律后的相关系数",
+            labels={"color": "相关系数"},
+        )
+        fig.update_layout(height=520, margin=dict(l=10, r=10, t=45, b=10))
+        st.plotly_chart(fig, width="stretch")
+    with right:
+        rain_frame = filtered_multivariate.copy()
+        rain_frame["天气"] = rain_frame["has_rain"].map({0: "无雨", 1: "有雨"})
+        rain_comparison = (
+            rain_frame.groupby("天气")
+            .agg(
+                时间点=("has_rain", "size"),
+                平均占用率=("utilization", "mean"),
+                平均电量=("avg_volume", "mean"),
+                平均时长=("avg_duration", "mean"),
+                平均价格=("avg_price", "mean"),
+            )
+            .reset_index()
+        )
+        rain_comparison["平均占用率"] = rain_comparison["平均占用率"].map(lambda value: f"{value:.1%}")
+        for column in ("平均电量", "平均时长", "平均价格"):
+            rain_comparison[column] = rain_comparison[column].round(2)
+        st.subheader("雨天 / 非雨天描述统计")
+        st.dataframe(rain_comparison, width="stretch", hide_index=True)
+        st.info("降雨与温湿度高度相关，且样本只有30天；这里展示的是描述性关联，不能解释为天气造成了需求变化。")
+
+    st.download_button(
+        "下载当前多变量数据（CSV）",
+        filtered_multivariate.reset_index().to_csv(index=False).encode("utf-8-sig"),
+        "shenzhen_ev_weather_energy.csv",
+        "text/csv",
+    )
+
+with tabs[3]:
     st.subheader("交通分区空间分布")
     st.markdown(f'<div class="section-note">当前显示 {len(visible_zones)} 个分区；侧栏的日期、区域属性和定价方式筛选均已生效。</div>', unsafe_allow_html=True)
     metric_map = {
@@ -264,7 +383,7 @@ with tabs[2]:
         mime="text/csv",
     )
 
-with tabs[3]:
+with tabs[4]:
     st.subheader("交通分区充电模式聚类")
     st.caption("K-Means 使用24小时占用率曲线、充电桩容量、平均价格、CBD和动态定价属性；全部特征在聚类前进行标准化。")
     cluster_count = st.slider("聚类数量 K", min_value=3, max_value=6, value=4)
@@ -354,19 +473,22 @@ with tabs[3]:
         mime="text/csv",
     )
 
-with tabs[4]:
+with tabs[5]:
     st.subheader("全市短期充电需求预测")
-    st.caption("目标为下一小时的全市平均忙碌充电桩数。训练与测试严格按时间先后切分，避免未来信息泄漏。")
-    forecast_metrics, predictions, importance, split_time = get_forecast(full_summary)
+    st.caption("目标为下一小时的全市平均忙碌充电桩数。三个方案使用同一时间测试集；增强模型假设当小时天气预报和定价计划已知。")
+    forecast_exogenous = full_multivariate[["temperature", "humidity", "wind_speed", "has_rain", "avg_price"]]
+    forecast_metrics, predictions, importance, split_time = get_forecast(full_summary, forecast_exogenous)
     baseline = forecast_metrics.loc[forecast_metrics["model"] == "24小时季节性基线"].iloc[0]
     forest = forecast_metrics.loc[forecast_metrics["model"] == "随机森林"].iloc[0]
-    improvement = (baseline["MAE"] - forest["MAE"]) / baseline["MAE"] if baseline["MAE"] else 0
+    enhanced = forecast_metrics.loc[forecast_metrics["model"] == "随机森林（天气+价格）"].iloc[0]
+    baseline_improvement = (baseline["MAE"] - enhanced["MAE"]) / baseline["MAE"] if baseline["MAE"] else 0
+    weather_improvement = (forest["MAE"] - enhanced["MAE"]) / forest["MAE"] if forest["MAE"] else 0
 
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("测试集起点", split_time.strftime("%m-%d %H:%M"))
-    c2.metric("随机森林 MAE", f"{forest['MAE']:.1f}", f"较基线 {improvement:+.1%}")
-    c3.metric("随机森林 RMSE", f"{forest['RMSE']:.1f}")
-    c4.metric("随机森林 R²", f"{forest['R2']:.3f}")
+    c2.metric("基础模型 MAE", f"{forest['MAE']:.1f}")
+    c3.metric("天气增强 MAE", f"{enhanced['MAE']:.1f}", f"较基础 {weather_improvement:+.1%}")
+    c4.metric("天气增强 R²", f"{enhanced['R2']:.3f}")
 
     chart_data = predictions.tail(24 * 7).rename(
         columns={
@@ -374,6 +496,7 @@ with tabs[4]:
             "actual": "实际值",
             "seasonal_naive": "24小时季节性基线",
             "random_forest": "随机森林",
+            "weather_price_forest": "随机森林（天气+价格）",
         }
     )
     chart_long = chart_data.melt(
@@ -384,7 +507,7 @@ with tabs[4]:
         x="时间",
         y="忙碌充电桩数",
         color="序列",
-        color_discrete_map={"实际值": "#172f3f", "24小时季节性基线": "#ef9c66", "随机森林": "#16866f"},
+        color_discrete_map={"实际值": "#172f3f", "24小时季节性基线": "#ef9c66", "随机森林": "#8eb7aa", "随机森林（天气+价格）": "#16866f"},
     )
     fig.update_layout(height=440, margin=dict(l=10, r=10, t=30, b=10), hovermode="x unified")
     st.plotly_chart(fig, width="stretch")
@@ -396,7 +519,7 @@ with tabs[4]:
         display_metrics = display_metrics.rename(columns={"model": "模型"})
         st.subheader("回测指标")
         st.dataframe(display_metrics, width="stretch", hide_index=True)
-        st.caption("MAE/RMSE 越低越好；R² 越接近1越好。季节性基线使用前一天同一小时的需求作为预测。")
+        st.caption("MAE/RMSE 只在同一个目标内比较；不同单位的占用、时长、电量和价格不能直接横比 RMSE。")
     with right:
         top_features = importance.head(10).sort_values("importance")
         fig = px.bar(
@@ -415,12 +538,12 @@ with tabs[4]:
     d1.download_button("下载预测明细（CSV）", predictions.to_csv(index=False).encode("utf-8-sig"), "shenzhen_ev_forecast.csv", "text/csv")
     d2.download_button("下载模型指标（CSV）", forecast_metrics.to_csv(index=False).encode("utf-8-sig"), "shenzhen_ev_model_metrics.csv", "text/csv")
 
-    if forest["MAE"] < baseline["MAE"]:
-        st.success(f"随机森林的 MAE 相比24小时季节性基线降低 {improvement:.1%}，说明历史滞后和日历特征提供了额外预测信息。")
+    if enhanced["MAE"] < forest["MAE"]:
+        st.success(f"加入天气与价格后，MAE 相比基础随机森林降低 {weather_improvement:.1%}，相比24小时基线降低 {baseline_improvement:.1%}。")
     else:
-        st.warning("随机森林尚未优于季节性基线，说明当前需求的日周期较强；后续应加入天气、价格和节假日特征。")
+        st.warning("天气增强模型没有优于基础模型，说明30天样本中日周期和历史滞后仍是主要预测信号；不应夸大天气变量贡献。")
 
-with tabs[5]:
+with tabs[6]:
     st.subheader("当前筛选范围的数据质量")
     st.markdown('<div class="section-note">质量检查与日期筛选同步；异常记录只标记，不会静默修改原始值。</div>', unsafe_allow_html=True)
     report = quality_report(filtered_occupancy, filtered_price, data.information)
@@ -440,8 +563,12 @@ with tabs[5]:
         columns=["规则", "通过", "说明"],
     )
     st.dataframe(checks, width="stretch", hide_index=True)
+    st.info(
+        "小组清洗报告记录了159个超容量单元格，并将每个值下调1（合计159）。平台主指标仍保留官方原始占用数据，"
+        "避免静默改变研究对象；补充分析只引入已清洗的时长、电量和天气字段。"
+    )
 
-with tabs[6]:
+with tabs[7]:
     st.subheader("数据来源与计算口径")
     st.markdown('<div class="section-note">本页列出的行列数直接读取当前本地文件，便于核验界面中的每一个数字。</div>', unsafe_allow_html=True)
     dictionary = pd.DataFrame(
@@ -450,6 +577,7 @@ with tabs[6]:
             ["occupancy.csv", len(data.occupancy), len(data.occupancy.columns) + 1, "每5分钟各分区忙碌充电桩数"],
             ["price.csv", len(data.price), len(data.price.columns) + 1, "每5分钟各分区平均充电价格"],
             ["time.csv", len(data.timestamps), 6, "年、月、日、时、分、秒"],
+            ["supplemental_5min.csv.gz", len(supplemental), len(supplemental.columns) + 1, "小组整理的天气、平均时长和平均电量"],
         ],
         columns=["本地文件", "数据行数", "数据列数", "用途"],
     )
@@ -461,6 +589,8 @@ with tabs[6]:
     - 空间统计、质量检查与聚类使用侧栏选定日期范围；预测模型固定使用完整30天序列进行时间回测。
     - 地图圆点大小代表分区充电桩容量，颜色代表侧栏选择的空间指标。
     - 聚类输入为24小时占用率曲线、容量、价格、CBD与动态定价属性，输入特征先标准化。
-    - 预测测试集严格晚于训练集；随机森林不会读取未来时刻目标值。
+    - 天气相关性以每个时间点为一条观测，并先剔除典型小时规律；结果仅表示描述性关联，不代表因果关系。
+    - 预测测试集严格晚于训练集；随机森林只读取历史目标值。天气增强模型将当小时天气预报和定价计划视为已知外生变量。
+    - 小组提供的四目标 RMSE 图未用于模型优劣排序，因为不同目标的量纲不一致；平台只在同一占用目标内比较模型。
     """)
     st.link_button("打开 ST-EVCDP 官方数据仓库", "https://github.com/IntelligentSystemsLab/ST-EVCDP")

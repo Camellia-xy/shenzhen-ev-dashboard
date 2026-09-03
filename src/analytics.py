@@ -48,6 +48,32 @@ def typical_day(summary: pd.DataFrame) -> pd.DataFrame:
     return grouped.reset_index()
 
 
+def build_multivariate_frame(
+    summary: pd.DataFrame,
+    price: pd.DataFrame,
+    supplemental: pd.DataFrame,
+) -> pd.DataFrame:
+    """Align official demand/price with team-provided weather and energy metrics."""
+    official = summary[["busy_piles", "utilization"]].copy()
+    official["avg_price"] = price.mean(axis=1)
+    return official.join(supplemental, how="inner").sort_index()
+
+
+def hour_adjusted_correlations(
+    frame: pd.DataFrame,
+    columns: list[str],
+) -> pd.DataFrame:
+    """Correlate variables after removing their average 24-hour pattern.
+
+    Weather is shared by all 247 zones. Working at one row per timestamp avoids
+    pseudo-replication, while hour demeaning reduces mechanical time-of-day
+    confounding. The result remains descriptive rather than causal.
+    """
+    numeric = frame[columns].apply(pd.to_numeric, errors="coerce")
+    residual = numeric - numeric.groupby(frame.index.hour).transform("mean")
+    return residual.corr()
+
+
 def zone_cluster_features(
     occupancy: pd.DataFrame,
     price: pd.DataFrame,
@@ -110,7 +136,10 @@ def cluster_zones(
     return assignments, profiles, score
 
 
-def demand_forecast_features(summary: pd.DataFrame) -> pd.DataFrame:
+def demand_forecast_features(
+    summary: pd.DataFrame,
+    exogenous: pd.DataFrame | None = None,
+) -> pd.DataFrame:
     """Create leakage-safe hourly features for one-hour-ahead demand prediction."""
     hourly = summary["busy_piles"].resample("1h").mean().to_frame("target")
     hourly.index.name = "time"
@@ -126,22 +155,41 @@ def demand_forecast_features(summary: pd.DataFrame) -> pd.DataFrame:
         hourly[f"lag_{lag}"] = hourly["target"].shift(lag)
     hourly["rolling_24_mean"] = hourly["target"].shift(1).rolling(24).mean()
     hourly["rolling_24_std"] = hourly["target"].shift(1).rolling(24).std()
+    if exogenous is not None:
+        aggregation = {
+            "temperature": "mean",
+            "humidity": "mean",
+            "wind_speed": "mean",
+            "has_rain": "max",
+            "avg_price": "mean",
+        }
+        available = {key: value for key, value in aggregation.items() if key in exogenous.columns}
+        if available:
+            hourly = hourly.join(exogenous.resample("1h").agg(available), how="left")
     return hourly.dropna()
 
 
 def evaluate_demand_models(
     summary: pd.DataFrame,
     test_ratio: float = 0.2,
+    exogenous: pd.DataFrame | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.Timestamp]:
-    """Backtest a seasonal baseline and random forest using a chronological split."""
+    """Backtest seasonal and RF models using one shared chronological split."""
     if not 0.1 <= test_ratio <= 0.4:
         raise ValueError("测试集比例必须在 0.1 到 0.4 之间")
-    frame = demand_forecast_features(summary)
+    frame = demand_forecast_features(summary, exogenous=exogenous)
     split = int(len(frame) * (1 - test_ratio))
     if split < 50 or len(frame) - split < 10:
         raise ValueError("时间序列过短，无法进行可靠的训练测试切分")
 
-    feature_columns = [column for column in frame.columns if column != "target"]
+    external_columns = [
+        column
+        for column in ("temperature", "humidity", "wind_speed", "has_rain", "avg_price")
+        if column in frame.columns
+    ]
+    feature_columns = [
+        column for column in frame.columns if column != "target" and column not in external_columns
+    ]
     train, test = frame.iloc[:split], frame.iloc[split:]
     model = RandomForestRegressor(
         n_estimators=300,
@@ -157,8 +205,30 @@ def evaluate_demand_models(
     prediction_frame["seasonal_naive"] = test["lag_24"]
     prediction_frame["random_forest"] = model.predict(test[feature_columns])
 
+    importance_model = model
+    importance_columns = feature_columns
+    if external_columns:
+        enhanced_columns = feature_columns + external_columns
+        enhanced = RandomForestRegressor(
+            n_estimators=300,
+            max_depth=10,
+            min_samples_leaf=2,
+            random_state=42,
+            n_jobs=-1,
+        )
+        enhanced.fit(train[enhanced_columns], train["target"])
+        prediction_frame["weather_price_forest"] = enhanced.predict(test[enhanced_columns])
+        importance_model = enhanced
+        importance_columns = enhanced_columns
+
     rows = []
-    for name, column in (("24小时季节性基线", "seasonal_naive"), ("随机森林", "random_forest")):
+    model_columns = [
+        ("24小时季节性基线", "seasonal_naive"),
+        ("随机森林", "random_forest"),
+    ]
+    if "weather_price_forest" in prediction_frame:
+        model_columns.append(("随机森林（天气+价格）", "weather_price_forest"))
+    for name, column in model_columns:
         actual = prediction_frame["actual"]
         predicted = prediction_frame[column]
         rows.append(
@@ -171,7 +241,7 @@ def evaluate_demand_models(
         )
     metrics = pd.DataFrame(rows)
     importance = pd.DataFrame(
-        {"feature": feature_columns, "importance": model.feature_importances_}
+        {"feature": importance_columns, "importance": importance_model.feature_importances_}
     ).sort_values("importance", ascending=False)
     return metrics, prediction_frame.reset_index(), importance, test.index.min()
 

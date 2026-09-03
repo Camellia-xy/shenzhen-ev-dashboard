@@ -4,4 +4,6 @@ __pycache__/
 .pytest_cache/
 *.py[cod]
 .streamlit/secrets.toml
-data/processed/
+data/processed/*
+!data/processed/supplemental_5min.csv.gz
+!data/processed/preprocessing_report.csv
